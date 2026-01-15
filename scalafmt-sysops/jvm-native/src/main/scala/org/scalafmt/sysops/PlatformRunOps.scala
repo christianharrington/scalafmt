@@ -1,12 +1,14 @@
 package org.scalafmt.sysops
 
-import java.nio.file.Path
+import org.scalafmt.CompatCollections.JavaConverters._
+
+import java.io.File
+import java.nio.file.{Files, Path}
 import java.util.concurrent.{
   Executors, SynchronousQueue, ThreadPoolExecutor, TimeUnit,
 }
 
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService}
-import scala.sys.process.{Process, ProcessLogger}
 import scala.util.{Failure, Success, Try}
 
 private[scalafmt] object PlatformRunOps {
@@ -35,20 +37,36 @@ private[scalafmt] object PlatformRunOps {
     GranularDialectAsyncOps.parasiticExecutionContext
 
   def runArgv(cmd: Seq[String], cwd: Option[Path]): Try[Seq[String]] = {
-    val out = Seq.newBuilder[String]
-    val err = new StringBuilder()
-    val logger = ProcessLogger(out += _, err.append("\n> ").append(_))
-    def failed(e: Throwable) = {
+    // Use temp files to avoid pipe buffer deadlock on large outputs with scala-native
+    // Can be removed once scala-native is upgraded to 0.5.10
+    // See https://github.com/scalameta/scalafmt/issues/5165
+    val stdoutFile = File.createTempFile("scalafmt-stdout", ".tmp")
+    val stderrFile = File.createTempFile("scalafmt-stderr", ".tmp")
+    def failed(err: String)(e: Throwable) = {
       val msg = cmd
         .addString(new StringBuilder(), "Failed to run '", " ", "'. Error: ")
         .append(err).append('\n')
       Failure(new IllegalStateException(msg.toString(), e))
     }
     try {
-      val exit = Process(cmd, cwd.map(_.toFile)).!(logger)
-      if (exit != 0) failed(new RuntimeException("exit code " + exit))
-      else Success(out.result())
-    } catch { case e: Throwable => failed(e) }
+      val pb = new ProcessBuilder(cmd.asJava)
+      cwd.foreach(p => pb.directory(p.toFile))
+      pb.redirectOutput(stdoutFile)
+      pb.redirectError(stderrFile)
+
+      val process = pb.start()
+      val exit = process.waitFor()
+
+      val out = Files.readAllLines(stdoutFile.toPath).asScala.toSeq
+      val err = Files.readAllLines(stderrFile.toPath).asScala.mkString("\n")
+
+      if (exit != 0) failed(err)(new RuntimeException("exit code " + exit))
+      else Success(out)
+    } catch { case e: Throwable => failed("")(e) }
+    finally {
+      stdoutFile.delete()
+      stderrFile.delete()
+    }
   }
 
   def exit(code: Int): Nothing = sys.exit(code)
